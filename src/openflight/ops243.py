@@ -42,9 +42,16 @@ import time
 from dataclasses import dataclass
 from enum import Enum
 from typing import Callable, List, Optional
+from os import environ
+
 
 import serial
-import serial.tools.list_ports
+try:
+    import serial.tools.list_ports
+    HAS_LIST_PORTS = True
+except ImportError:
+    # Android/Termux environments block hardware enumeration
+    HAS_LIST_PORTS = False
 
 from .serial_latency import log_usb_serial_latency_timer
 
@@ -80,6 +87,11 @@ def is_uart_port(port: Optional[str]) -> bool:
     name = port.rsplit("/", 1)[-1]
     return name.startswith(_UART_PORT_PREFIXES)
 
+def is_udp_port(port: Optional[str]) -> bool:
+    """Return True when ``port`` requests a UDP network socket."""
+    if not port:
+        return False
+    return port.startswith("udp://")
 
 # Global flag to control raw reading console output
 _show_raw_readings = False
@@ -248,6 +260,9 @@ class OPS243Radar:
         # Most recent OPS-clock -> host-epoch sync (see read_clock_sync).
         self.last_clock_sync: Optional[dict] = None
 
+        self.is_udp = is_udp_port(port)
+        self.sock = None
+
     @staticmethod
     def find_radar_ports() -> List[str]:
         """
@@ -256,6 +271,10 @@ class OPS243Radar:
         Returns:
             List of port names that might be OPS243 devices
         """
+
+        if not HAS_LIST_PORTS:
+            return []
+
         ports = []
         for port in serial.tools.list_ports.comports():
             # OPS243 shows up as USB serial device
@@ -308,6 +327,18 @@ class OPS243Radar:
         """(Re)open ``self.port`` at ``baud``, closing any existing handle."""
         if self.serial is not None and getattr(self.serial, "is_open", False):
             self.serial.close()
+
+        if getattr(self, "is_udp", False):
+            import socket
+            self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            # Extract the port number from "udp://12345"
+            udp_port = int(self.port.replace("udp://", ""))
+            self.sock.bind(("0.0.0.0", udp_port))
+            
+            self.serial = type('MockSerial', (), {'is_open': True, 'in_waiting': 1024, 'timeout': timeout, 'write': lambda x: None, 'flush': lambda: None, 'reset_input_buffer': lambda: None})()
+            logger.info("[OPS] Transport=udp port=%s", self.port)
+            return
+            
         self.serial = serial.Serial(
             port=self.port,
             baudrate=baud,
@@ -1596,7 +1627,10 @@ class OPS243Radar:
         while time.time() < deadline:
             waiting = self.serial.in_waiting
             if waiting:
-                chunk = self.serial.read(waiting)
+                if getattr(self, "is_udp", False):
+                    chunk, _ = self.sock.recvfrom(waiting)
+                else:
+                    chunk = self.serial.read(waiting)
                 first_byte_timestamp = None
                 if not capture_started:
                     idle_bytes.extend(chunk)
@@ -2206,7 +2240,10 @@ class OPS243Radar:
 
         try:
             # Read available data and preserve partial JSON lines for the next poll.
-            raw_bytes = self.serial.read(self.serial.in_waiting)
+            if getattr(self, "is_udp", False):
+                raw_bytes, _ = self.sock.recvfrom(self.serial.in_waiting)
+            else:
+                raw_bytes = self.serial.read(self.serial.in_waiting)
             self._speed_read_buffer += raw_bytes.decode("ascii", errors="ignore")
 
             if "\n" not in self._speed_read_buffer and "\r" not in self._speed_read_buffer:
