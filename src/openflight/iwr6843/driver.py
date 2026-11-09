@@ -27,9 +27,49 @@ _PORT_GLOBS = ("/dev/ttyUSB*", "/dev/tty.SLAB_USBtoUART*")
 
 logger = logging.getLogger(__name__)
 
+def is_udp_port(port: str | None) -> bool:
+    return bool(port and port.startswith("udp://"))
+
+class UDPSerialWrapper:
+    """Duck-types a serial.Serial object to route TI radar traffic over UDP."""
+    def __init__(self, port_string: str, timeout: float):
+        import socket
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock.settimeout(timeout)
+        udp_port = int(port_string.replace("udp://", ""))
+        self.sock.bind(("0.0.0.0", udp_port))
+        logger.info(f"[IWR6843] Connected via UDP on port {udp_port}")
+        
+    @property
+    def in_waiting(self) -> int:
+        import select
+        # Ask the OS if there is a UDP packet waiting in the buffer (0.0s timeout)
+        ready, _, _ = select.select([self.sock], [], [], 0.0)
+        # If ready, tell the read loop there is plenty of data to pull
+        return 4096 if ready else 0
+
+    def read(self, size: int = 1) -> bytes:
+        try:
+            data, _ = self.sock.recvfrom(size)
+            return data
+        except Exception:
+            return b"" # Return empty bytes on timeout, exactly like pyserial does
+
+    def write(self, data: bytes) -> int:
+        return len(data) # Ghost write: pretend we successfully sent the bytes
+        
+    def reset_input_buffer(self) -> None:
+        pass # Ghost flush
+        
+    def close(self) -> None:
+        self.sock.close()
+
 
 def open_port(port: str, baud: int = BAUD, timeout: float = 0.3) -> serial.Serial:
     """DTR/RTS-safe serial open."""
+    if is_udp_port(port):
+        return UDPSerialWrapper(port, timeout)
+
     ser = serial.Serial()
     ser.port, ser.baudrate, ser.timeout = port, baud, timeout
     ser.dtr = False
