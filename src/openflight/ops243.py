@@ -330,12 +330,26 @@ class OPS243Radar:
 
         if getattr(self, "is_udp", False):
             import socket
+            import select
             self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            # Extract the port number from "udp://12345"
             udp_port = int(self.port.replace("udp://", ""))
             self.sock.bind(("0.0.0.0", udp_port))
             
-            self.serial = type('MockSerial', (), {'is_open': True, 'in_waiting': 1024, 'timeout': timeout, 'write': lambda x: None, 'flush': lambda: None, 'reset_input_buffer': lambda: None})()
+            # Smart MockSerial that actually checks the network buffer
+            class OPSMockSerial:
+                is_open = True
+                timeout = timeout
+                def __init__(self, s): self.s = s
+                @property
+                def in_waiting(self):
+                    # Ask the OS if a UDP packet has arrived
+                    ready, _, _ = select.select([self.s], [], [], 0.0)
+                    return 1024 if ready else 0
+                def write(self, data): return len(data)
+                def flush(self): pass
+                def reset_input_buffer(self): pass
+                
+            self.serial = OPSMockSerial(self.sock)
             logger.info("[OPS] Transport=udp port=%s", self.port)
             return
             
